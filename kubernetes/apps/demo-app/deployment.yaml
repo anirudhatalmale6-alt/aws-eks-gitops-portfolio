@@ -1,0 +1,240 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+    app.kubernetes.io/part-of: eks-gitops-portfolio
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # With 3 replicas and a PodDisruptionBudget of minAvailable 2, surging by
+      # one and never taking more than one down means a rollout cannot breach
+      # the budget and stall halfway.
+      maxSurge: 1
+      maxUnavailable: 0
+
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: demo-app
+        app.kubernetes.io/part-of: eks-gitops-portfolio
+    spec:
+      serviceAccountName: demo-app
+      automountServiceAccountToken: false
+
+      # POD level security context. fsGroup is the one that is not decorative.
+      #
+      # The container renders its nginx config at startup into
+      # /etc/nginx/conf.d, which has to be a writable mount because the root
+      # filesystem is read-only. A Kubernetes emptyDir arrives owned root:root,
+      # and this container runs as uid 101, so without fsGroup the render
+      # silently fails and nginx serves the base image's default site with no
+      # /healthz. The image now refuses to start in that case rather than
+      # serving the wrong thing; see app/docker-entrypoint.d/.
+      #
+      # fsGroupChangePolicy: OnRootMismatch skips the recursive chown when the
+      # top-level ownership already matches, which keeps pod start fast once
+      # volumes get large.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+
+      # Spread replicas across availability zones. ScheduleAnyway rather than
+      # DoNotSchedule: on a two node cluster a hard constraint would leave the
+      # third replica Pending forever, and a Pending pod is a worse outage than
+      # an uneven spread.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: demo-app
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: demo-app
+
+      containers:
+        - name: nginx
+          # Replaced by the kustomize images transformer in kustomization.yaml,
+          # which is the one place the tag lives. CI updates it there and
+          # commits; Argo CD notices the commit and rolls the Deployment. No
+          # pipeline ever runs kubectl against the cluster.
+          image: demo-app
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+
+          env:
+            # The downward API is how the page knows which pod answered,
+            # with no application code and no service account token.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: CLUSTER_NAME
+              valueFrom:
+                configMapKeyRef:
+                  name: demo-app-config
+                  key: cluster_name
+            - name: APP_VERSION
+              valueFrom:
+                configMapKeyRef:
+                  name: demo-app-config
+                  key: app_version
+
+          # Three probes, three different jobs. Collapsing them into one is the
+          # usual mistake.
+          #
+          # startup   - gives a slow first boot time to finish WITHOUT the
+          #             liveness probe killing it. While it runs, liveness is
+          #             suspended.
+          # readiness - controls whether this pod receives traffic. Failing it
+          #             removes the pod from the Service endpoints. Nothing
+          #             restarts.
+          # liveness  - restarts the container. Deliberately slower and more
+          #             tolerant than readiness, because a restart during a
+          #             transient blip turns a small problem into an outage.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              # Memory limit but NO cpu limit, on purpose.
+              #
+              # A memory limit is a real safety net: exceed it and the kernel
+              # OOM-kills the container, which is better than it eating the node
+              # and taking the kubelet down with it.
+              #
+              # A CPU limit is enforced by CFS throttling, which pauses the
+              # process for the rest of the 100ms period once the quota is
+              # spent. On a bursty web workload that shows up as latency spikes
+              # on a node with plenty of idle CPU. The request already
+              # guarantees a share under contention, so the limit buys nothing
+              # here and costs tail latency.
+              memory: 96Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+
+        #
+        # Metrics sidecar
+        # ---------------
+        # nginx exposes its counters in its own plain-text format at
+        # /stub_status; Prometheus cannot read that. The official exporter
+        # translates it, and it runs in the same pod so it can reach
+        # 127.0.0.1:8080, which /stub_status is restricted to. Nothing outside
+        # the pod can read the status page.
+        #
+        - name: metrics
+          image: docker.io/nginx/nginx-prometheus-exporter:1.4.2
+          imagePullPolicy: IfNotPresent
+
+          args:
+            - --nginx.scrape-uri=http://127.0.0.1:8080/stub_status
+            - --web.listen-address=:9113
+
+          ports:
+            - name: metrics
+              containerPort: 9113
+              protocol: TCP
+
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            periodSeconds: 10
+
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 48Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 101
+            capabilities:
+              drop: ["ALL"]
+
+      volumes:
+        # All three are emptyDir because the root filesystem is read-only and
+        # nginx has to write its rendered config, its cache and its temp files
+        # somewhere. emptyDir lives and dies with the pod, which is correct:
+        # none of this is state worth keeping.
+        - name: nginx-conf
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

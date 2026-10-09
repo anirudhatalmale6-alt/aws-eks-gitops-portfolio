@@ -1,0 +1,177 @@
+#
+# kube-prometheus-stack
+# =====================
+# Prometheus, Alertmanager, Grafana, node-exporter, kube-state-metrics and the
+# Prometheus Operator, plus the ServiceMonitor and PrometheusRule CRDs that
+# demo-app depends on. Hence the sync wave: this has to be Healthy before
+# demo-app is applied.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: portfolio
+
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 92.2.0
+
+    helm:
+      releaseName: kube-prometheus-stack
+      # The chart renders a lot of objects and the CRDs are large; the default
+      # 300 second timeout is not always enough on a two node cluster.
+      values: |
+        crds:
+          enabled: true
+
+        prometheus:
+          prometheusSpec:
+            retention: 7d
+            retentionSize: 15GB
+
+            # false means "watch ServiceMonitors in every namespace regardless
+            # of the release label". The chart's default is true, which makes
+            # the operator add a selector for its own release, and is the single
+            # most common reason a correctly written ServiceMonitor is simply
+            # ignored with no error anywhere.
+            #
+            # demo-app's ServiceMonitor ALSO carries the matching release label,
+            # so it would be picked up either way. Belt and braces, because
+            # debugging a target that never appears is miserable.
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+
+            resources:
+              requests:
+                cpu: 150m
+                memory: 1Gi
+              limits:
+                memory: 2Gi
+
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  # Named explicitly rather than relying on the default class.
+                  # EKS ships gp2 as default and kubernetes/platform adds gp3;
+                  # naming it here means this works even if somebody forgets to
+                  # take the default flag off gp2.
+                  storageClassName: gp3
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 20Gi
+
+        alertmanager:
+          alertmanagerSpec:
+            resources:
+              requests:
+                cpu: 25m
+                memory: 96Mi
+              limits:
+                memory: 256Mi
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp3
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 5Gi
+
+        grafana:
+          enabled: true
+
+          # No admin password is set here on purpose. The chart generates one
+          # and stores it in the kube-prometheus-stack-grafana Secret; read it
+          # with the command in docs/05-monitoring.md. Committing a password to
+          # a public repository to save one kubectl command is not a trade worth
+          # making, and "it is only a demo" is exactly how real credentials end
+          # up in git history.
+          adminPassword: null
+
+          persistence:
+            enabled: true
+            storageClassName: gp3
+            size: 5Gi
+
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 384Mi
+
+          # The sidecar watches for ConfigMaps labelled grafana_dashboard and
+          # loads them. That is how kubernetes/platform/grafana-dashboard-*.yaml
+          # reach Grafana without anybody clicking Import, and why a dashboard
+          # lives in git as a reviewable object.
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              searchNamespace: ALL
+            datasources:
+              enabled: true
+
+          # No Ingress. Grafana behind a public ALB with a generated password is
+          # an open door that search engines find. Reach it with:
+          #   kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80
+          # docs/05-monitoring.md explains what to add if you want it published
+          # properly, behind TLS and an identity provider.
+          ingress:
+            enabled: false
+
+        # Not applicable on EKS: the control plane is managed by AWS and these
+        # components are not reachable or scrapeable. Left enabled, they produce
+        # permanently firing "target down" alerts that teach everyone to ignore
+        # alerts, which is worse than having none.
+        kubeControllerManager:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeEtcd:
+          enabled: false
+        kubeProxy:
+          enabled: false
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 20s
+        factor: 2
+        maxDuration: 5m
+
+  ignoreDifferences:
+    # The operator writes a caBundle into its own webhook configuration at
+    # runtime. Git cannot know that value, so Argo CD would report the
+    # Application permanently OutOfSync and, with selfHeal on, keep wiping the
+    # bundle and breaking admission.
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      name: kube-prometheus-stack-admission
+      jqPathExpressions:
+        - .webhooks[]?.clientConfig.caBundle
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+      name: kube-prometheus-stack-admission
+      jqPathExpressions:
+        - .webhooks[]?.clientConfig.caBundle

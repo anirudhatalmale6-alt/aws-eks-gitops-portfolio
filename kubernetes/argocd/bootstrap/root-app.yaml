@@ -1,0 +1,54 @@
+#
+# The app of apps
+# ===============
+# This is the ONLY thing applied to the cluster by hand. It points Argo CD at
+# kubernetes/argocd/applications/, so from here on adding a component to the
+# cluster is adding a file to that directory and pushing. Nobody runs kubectl
+# again.
+#
+# Apply it with:
+#   kubectl apply -f kubernetes/argocd/projects/portfolio.yaml
+#   kubectl apply -f kubernetes/argocd/bootstrap/root-app.yaml
+#
+# Order matters: the Applications reference the project, and an Application
+# whose project does not exist yet will not sync.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  finalizers:
+    # Cascading delete. Removing the root Application removes every Application
+    # it created, and those in turn remove their workloads. Without it, deleting
+    # root leaves the whole cluster running with nothing managing it.
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: portfolio
+
+  source:
+    repoURL: GIT_REPO_URL_PLACEHOLDER
+    targetRevision: main
+    path: kubernetes/argocd/applications
+    directory:
+      recurse: true
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      # Delete Applications that were removed from git.
+      prune: true
+      # Revert anything changed in the cluster by hand back to what git says.
+      # This is the line that turns "we use GitOps" into something true.
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

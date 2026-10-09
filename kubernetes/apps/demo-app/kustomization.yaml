@@ -1,0 +1,38 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: demo
+
+resources:
+  - namespace.yaml
+  - service.yaml
+  - deployment.yaml
+  - ingress.yaml
+  - autoscaling.yaml
+  - monitoring.yaml
+
+#
+# The one place the image tag lives
+# ---------------------------------
+# The Deployment says `image: demo-app` and nothing else. This transformer
+# rewrites it on the way out.
+#
+# That single fact is what makes this GitOps rather than a pipeline that pokes
+# the cluster. The build workflow pushes an image, then edits newName and newTag
+# HERE and commits. Argo CD sees the commit and rolls the Deployment. No CI job
+# ever holds kubectl credentials, and `git log` on this file is a complete,
+# accurate deployment history.
+#
+# newName is a placeholder until scripts/render-manifests.sh fills in the real
+# ECR URL from the terraform output.
+#
+images:
+  - name: demo-app
+    newName: ECR_REPOSITORY_URL_PLACEHOLDER
+    newTag: "dev"
+
+labels:
+  - includeSelectors: false
+    pairs:
+      app.kubernetes.io/part-of: eks-gitops-portfolio
+      app.kubernetes.io/managed-by: argocd

@@ -1,0 +1,103 @@
+#
+# AWS Load Balancer Controller
+# ============================
+# Turns an Ingress object into a real ALB. Without it, `kubectl get ingress`
+# shows an empty ADDRESS column forever and nothing in the cluster explains why.
+#
+# It needs AWS permissions, which arrive through IRSA: terraform creates the
+# role, and the annotation below puts the role ARN on the service account the
+# chart creates. Get that annotation wrong and the controller starts fine, then
+# logs AccessDenied on its first ELB call.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: aws-load-balancer-controller
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: portfolio
+
+  source:
+    repoURL: https://aws.github.io/eks-charts
+    chart: aws-load-balancer-controller
+    # Pinned, not a range. An Argo CD Application with a floating chart version
+    # silently upgrades a cluster component the next time it refreshes, which is
+    # the opposite of what GitOps is for. Upgrading is a commit.
+    targetRevision: 3.6.0
+
+    helm:
+      releaseName: aws-load-balancer-controller
+      values: |
+        # The controller tags every resource it creates with this name and
+        # refuses to touch resources tagged for a different cluster. A wrong
+        # value here is how a controller in one cluster deletes another
+        # cluster's load balancers.
+        clusterName: CLUSTER_NAME_PLACEHOLDER
+
+        # Both are discoverable from instance metadata, but IMDSv2 is enforced
+        # with a hop limit of 1 on these nodes, so a POD cannot reach the
+        # metadata service. Passing them explicitly is not an optimisation here,
+        # it is required.
+        region: AWS_REGION_PLACEHOLDER
+        vpcId: VPC_ID_PLACEHOLDER
+
+        serviceAccount:
+          create: true
+          name: aws-load-balancer-controller
+          annotations:
+            # Must match the service account named in the IRSA role's trust
+            # policy, system:serviceaccount:kube-system:aws-load-balancer-controller.
+            eks.amazonaws.com/role-arn: ALB_CONTROLLER_ROLE_ARN_PLACEHOLDER
+
+        # Two replicas with a hard anti-affinity so a single node going away,
+        # which on a SPOT node group is routine, does not leave Ingress
+        # unmanaged.
+        replicaCount: 2
+
+        affinity:
+          podAntiAffinity:
+            requiredDuringSchedulingIgnoredDuringExecution:
+              - topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: aws-load-balancer-controller
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            memory: 256Mi
+
+        # The service mutator webhook rewrites every LoadBalancer Service in the
+        # cluster to use the NLB provisioned by this controller instead of the
+        # in-tree AWS provider. Left on, because a Service that silently gets a
+        # classic ELB from the in-tree provider is a confusing thing to debug.
+        enableServiceMutatorWebhook: true
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      # The chart ships CRDs with very large OpenAPI schemas. A client-side
+      # apply stores the whole manifest in the
+      # kubectl.kubernetes.io/last-applied-configuration annotation, which can
+      # exceed the 262144 byte annotation limit and fail with
+      # "metadata.annotations: Too long". Server-side apply has no such
+      # annotation.
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

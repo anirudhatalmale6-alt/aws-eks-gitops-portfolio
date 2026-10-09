@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo workload on EKS</title>
+<style>
+  :root { color-scheme: light dark; --fg:#101418; --bg:#f6f7f9; --card:#fff; --mut:#5b6672; --line:#dfe3e8; --ok:#1f7a3d; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8ecf1; --bg:#0d1117; --card:#161b22; --mut:#8b949e; --line:#2a313a; --ok:#3fb950; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:2rem 1.25rem; background:var(--bg); color:var(--fg);
+         font:16px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  main { max-width: 46rem; margin: 0 auto; }
+  h1 { font-size:1.4rem; margin:0 0 .25rem; letter-spacing:-.01em; }
+  p.sub { color:var(--mut); margin:0 0 1.75rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:1.25rem 1.4rem; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:.55rem 1.25rem; margin:0; }
+  dt { color:var(--mut); white-space:nowrap; }
+  dd { margin:0; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.92rem; word-break:break-all; }
+  .pill { display:inline-block; font-size:.78rem; padding:.15rem .5rem; border-radius:999px;
+          border:1px solid var(--ok); color:var(--ok); vertical-align:2px; }
+  footer { color:var(--mut); font-size:.85rem; margin-top:1.5rem; }
+  code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Demo workload <span class="pill">running</span></h1>
+  <p class="sub">Served by nginx from a pod on Amazon EKS. Reload to see the load balancer pick a different pod.</p>
+
+  <div class="card">
+    <dl>
+      <dt>Pod</dt>        <dd>__POD_NAME__</dd>
+      <dt>Namespace</dt>  <dd>__POD_NAMESPACE__</dd>
+      <dt>Node</dt>       <dd>__NODE_NAME__</dd>
+      <dt>Pod IP</dt>     <dd>__POD_IP__</dd>
+      <dt>Cluster</dt>    <dd>__CLUSTER_NAME__</dd>
+      <dt>Image tag</dt>  <dd>__APP_VERSION__</dd>
+    </dl>
+  </div>
+
+  <footer>
+    Probes: <code>/healthz</code>, <code>/readyz</code>. Metrics are scraped by a
+    sidecar from <code>/stub_status</code>, which is bound to loopback and not
+    reachable through this address.
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,127 @@
+#
+# terraform apply
+# ===============
+# Manual only. There is no push trigger, on purpose: a stack that creates an EKS
+# cluster and IAM roles should not be applied by a merge that someone did not
+# realise would cost money.
+#
+# The gate is the `aws-dev` GitHub environment. Configure it once, in
+# Settings > Environments > aws-dev:
+#
+#   Deployment branches     limit to `main`
+#   Required reviewers      add yourself
+#
+# Those two settings are the actual security control. The AWS trust policy for
+# this role is conditioned on
+# repo:OWNER/REPO:environment:aws-dev, so a job that does not declare this
+# environment cannot assume the role at all. GitHub puts the environment in the
+# OIDC sub claim INSTEAD of the branch ref, which is exactly why the branch
+# restriction has to be configured on the environment rather than asserted in
+# the trust policy.
+#
+name: terraform-apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "apply" to confirm. This creates billable AWS resources.'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  # NOT cancel-in-progress. Interrupting a terraform apply leaves the state lock
+  # held and the real infrastructure in an unknown state. A second run queues
+  # behind the first instead.
+  group: terraform-apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    name: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: aws-dev
+
+    defaults:
+      run:
+        working-directory: terraform/envs/dev
+
+    steps:
+      - name: Check the confirmation
+        if: inputs.confirm != 'apply'
+        run: |
+          echo "::error::Type 'apply' in the confirm field to run this workflow."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          terraform_wrapper: false
+
+      - name: Assume the apply role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TERRAFORM_APPLY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-apply-${{ github.run_id }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      # Plan first, then apply that exact plan file. Running `apply` without a
+      # plan file means terraform re-plans against whatever the account looks
+      # like at that moment, so what gets built is not necessarily what the
+      # reviewer approved.
+      - name: terraform plan
+        run: |
+          terraform plan -input=false -no-color -lock-timeout=10m \
+            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_repo=${{ github.event.repository.name }}" \
+            -var="state_bucket_name=${{ vars.TF_STATE_BUCKET }}" \
+            -out=tfplan
+
+      - name: terraform apply
+        run: terraform apply -input=false -no-color -lock-timeout=10m tfplan
+
+      - name: Outputs
+        if: always()
+        run: |
+          {
+            echo "### Outputs"
+            echo
+            echo '```'
+            # Sensitive outputs are redacted by terraform itself; nothing here
+            # is marked sensitive, because none of it is a credential.
+            terraform output || echo "(no outputs)"
+            echo '```'
+            echo
+            echo "### Cost"
+            echo
+            echo '```'
+            terraform output -raw cost_note 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Said out loud on every run, because the single most expensive mistake
+      # with this project is leaving it running.
+      - name: Reminder
+        if: always()
+        run: |
+          {
+            echo
+            echo "> Remember to run \`make destroy\` once you have your screenshots."
+            echo "> The control plane bills by the hour whether or not anyone is looking at it."
+          } >> "$GITHUB_STEP_SUMMARY"

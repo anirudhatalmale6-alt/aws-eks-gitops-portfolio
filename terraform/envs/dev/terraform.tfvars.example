@@ -1,0 +1,53 @@
+# Copy to terraform.tfvars and edit. Two values have no sensible default and
+# terraform will stop and ask for them if you skip this:
+#
+#   github_owner      - your GitHub username or organisation
+#   state_bucket_name - from `cd ../../bootstrap && terraform output state_bucket_name`
+
+github_owner      = "YOUR-GITHUB-USERNAME"
+github_repo       = "aws-eks-gitops-portfolio"
+state_bucket_name = "eks-gitops-portfolio-tfstate-000000000000"
+
+project     = "eks-gitops"
+environment = "dev"
+aws_region  = "us-east-1"
+
+# Three AZs is the default. Two is cheaper if single_nat_gateway is false.
+availability_zone_count = 3
+vpc_cidr                = "10.0.0.0/16"
+
+# One NAT gateway instead of three. Saves about 64 USD a month. Flip to false
+# when you want to screenshot a genuinely highly available network diagram, then
+# flip it back.
+single_nat_gateway = true
+
+# Leave null to take whatever version AWS currently marks as the default for new
+# clusters. Pin it, for example "1.33", when you want the repo to be reproducible
+# six months from now.
+kubernetes_version = null
+
+# SPOT at roughly 30 percent of on-demand. Two t3.large is the floor that fits
+# Argo CD, kube-prometheus-stack and the demo app without pods going Pending.
+node_capacity_type  = "SPOT"
+node_instance_types = ["t3.large", "t3a.large", "t3.xlarge"]
+node_min_size       = 2
+node_max_size       = 4
+node_desired_size   = 2
+
+# STRONGLY recommended: replace with your own address so the Kubernetes API is
+# not reachable from the whole internet. Find it with: curl -s ifconfig.me
+# Leaving it open is survivable because the only way in is still an IAM identity,
+# but it is the first thing a reviewer will notice.
+api_public_access_cidrs = ["0.0.0.0/0"]
+
+enable_flow_logs = true
+
+# Set to false if your AWS account ALREADY has a GitHub OIDC provider, and pass
+# its ARN instead. Check with:
+#   aws iam list-open-id-connect-providers
+create_github_oidc_provider = true
+# existing_github_oidc_provider_arn = "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"
+
+tags = {
+  Owner = "YOUR-NAME"
+}

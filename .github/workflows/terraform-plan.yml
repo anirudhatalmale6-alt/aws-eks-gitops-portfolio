@@ -1,0 +1,163 @@
+#
+# terraform plan on pull requests
+# ===============================
+# Reads AWS, writes nothing except the state lock file, and posts the plan as a
+# comment on the pull request so the diff is reviewed before anyone can apply
+# it.
+#
+# Authentication is GitHub OIDC. There is no AWS_ACCESS_KEY_ID anywhere in this
+# repository or in its secrets. The job asks GitHub for a short-lived signed
+# token, hands it to STS, and gets credentials that expire when the job does.
+#
+# Setup, once:
+#   terraform -chdir=terraform/envs/dev output github_variable_setup_commands
+# then run the commands it prints. They are repository VARIABLES, not secrets,
+# because a role ARN is not a credential and hiding it only makes debugging
+# harder.
+#
+name: terraform-plan
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+  workflow_dispatch:
+
+permissions:
+  # id-token: write is what allows the job to request an OIDC token. Omit it and
+  # configure-aws-credentials fails with "Credentials could not be loaded",
+  # which reads like a secrets problem and is not one.
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: terraform-plan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # A pull request from a FORK gets no OIDC token, by design: otherwise anyone
+    # who forked this repo could run a workflow that assumes a role in the AWS
+    # account. Skip rather than fail, so the offline ci workflow is still the
+    # meaningful signal on a fork's pull request.
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+
+    defaults:
+      run:
+        working-directory: terraform/envs/dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+          # The wrapper rewrites stdout to add its own markers, which makes the
+          # plan text awkward to post verbatim. The plan is captured from a file
+          # instead.
+          terraform_wrapper: false
+
+      - name: Assume the read-only plan role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_TERRAFORM_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-plan-${{ github.run_id }}
+
+      - name: Who am I
+        run: aws sts get-caller-identity
+
+      - name: terraform init
+        run: |
+          terraform init -input=false \
+            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ vars.AWS_REGION }}"
+
+      - name: terraform plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=5m \
+            -var="github_owner=${{ github.repository_owner }}" \
+            -var="github_repo=${{ github.event.repository.name }}" \
+            -var="state_bucket_name=${{ vars.TF_STATE_BUCKET }}" \
+            -out=tfplan > plan.txt 2>&1
+          status=$?
+          set -e
+          echo "exitcode=$status" >> "$GITHUB_OUTPUT"
+          tail -c 60000 plan.txt
+          exit $status
+
+      - name: Summarise the plan
+        if: always()
+        run: |
+          {
+            echo "### terraform plan"
+            echo
+            echo '```terraform'
+            # A plan for this stack is long. The summary gets the tail, which is
+            # where the resource counts and any errors are; the full text is in
+            # the job log.
+            tail -c 60000 plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the pull request
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const MAX = 60000;          // GitHub rejects a comment over 65536
+            let plan = '';
+            try { plan = fs.readFileSync('terraform/envs/dev/plan.txt', 'utf8'); }
+            catch { plan = '(no plan output was produced)'; }
+
+            let truncated = false;
+            if (plan.length > MAX) { plan = plan.slice(-MAX); truncated = true; }
+
+            const ok = '${{ steps.plan.outputs.exitcode }}' === '0';
+            const marker = '<!-- terraform-plan-comment -->';
+            const body = [
+              marker,
+              `### terraform plan ${ok ? 'succeeded' : 'FAILED'}`,
+              '',
+              truncated ? '_Output truncated; the full plan is in the job log._' : '',
+              '',
+              '<details><summary>Plan output</summary>',
+              '',
+              '```terraform',
+              plan,
+              '```',
+              '</details>',
+            ].join('\n');
+
+            // Update the existing comment rather than adding another one on
+            // every push. A pull request with fourteen plan comments is a pull
+            // request nobody reads.
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const mine = comments.find(c => c.body && c.body.includes(marker));
+            if (mine) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: mine.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+      # The plan binary is what `apply` should consume, so that what was
+      # reviewed is what is applied. Retained briefly: a plan goes stale as soon
+      # as anything else changes in the account.
+      - name: Upload the plan
+        if: steps.plan.outputs.exitcode == '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.run_id }}
+          path: terraform/envs/dev/tfplan
+          retention-days: 3

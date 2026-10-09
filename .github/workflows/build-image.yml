@@ -1,0 +1,228 @@
+#
+# Build the image, push it, then commit the new tag
+# =================================================
+# This is the GitOps loop, and the last step is the one that makes it GitOps.
+#
+#   1. build the image
+#   2. push it to ECR, tagged with the commit SHA
+#   3. write that tag into kubernetes/apps/demo-app/kustomization.yaml
+#   4. commit and push
+#   5. ...and stop. Argo CD notices the commit and rolls the Deployment.
+#
+# What this workflow deliberately does NOT have: kubectl, a kubeconfig, or any
+# cluster credential. CI can write to a git repository and to a container
+# registry, and that is all. Nothing in the pipeline can reach the cluster, so a
+# compromised workflow cannot deploy to it either.
+#
+# The side effect is that `git log` on kustomization.yaml is a complete and
+# accurate deployment history, because there is no other path by which the
+# running image can change.
+#
+name: build-image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - '.github/workflows/build-image.yml'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  # Needed for step 4. The commit is made with GITHUB_TOKEN, which does NOT
+  # retrigger workflows, so this cannot loop.
+  contents: write
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build and push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit in step 4 needs the branch, not a detached HEAD.
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Short SHA
+        id: sha
+        run: echo "short=sha-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Assume the ECR push role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Scoped to ECR, and within ECR to this one repository. It cannot
+          # touch anything else in the account.
+          role-to-assume: ${{ vars.AWS_ECR_PUSH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-ecr-${{ github.run_id }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # The ECR repository is IMMUTABLE: a tag, once pushed, cannot be moved.
+      # Re-running this workflow on an unchanged commit would otherwise fail the
+      # push with ImageTagAlreadyExists, which is correct behaviour but a
+      # confusing way to find out.
+      - name: Does this tag already exist
+        id: exists
+        run: |
+          if aws ecr describe-images \
+               --repository-name "${{ vars.ECR_REPOSITORY }}" \
+               --image-ids imageTag="${{ steps.sha.outputs.short }}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.sha.outputs.short }} is already in ECR. Skipping the push; the manifest update still runs."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.exists.outputs.found == 'false'
+
+      - name: Build and push
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          # Only the SHA tag. No :latest, because an immutable repository cannot
+          # move it and because "deploy latest" is not a thing anyone can roll
+          # back from.
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ steps.sha.outputs.short }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Prove the image works before pointing the cluster at it. This is the
+      # same script `make validate` runs, including the negative test that the
+      # container refuses to start when its config cannot be rendered.
+      - name: Test the image
+        run: ./scripts/check_image.sh docker
+
+      - name: Wait for the ECR scan
+        if: steps.exists.outputs.found == 'false'
+        run: |
+          # Basic scanning is asynchronous; findings are not available the
+          # instant the push returns.
+          for _ in $(seq 1 20); do
+            status="$(aws ecr describe-image-scan-findings \
+              --repository-name '${{ vars.ECR_REPOSITORY }}' \
+              --image-id imageTag='${{ steps.sha.outputs.short }}' \
+              --query 'imageScanStatus.status' --output text 2>/dev/null || echo PENDING)"
+            [[ "$status" == "COMPLETE" || "$status" == "FAILED" ]] && break
+            sleep 15
+          done
+
+          findings="$(aws ecr describe-image-scan-findings \
+            --repository-name '${{ vars.ECR_REPOSITORY }}' \
+            --image-id imageTag='${{ steps.sha.outputs.short }}' \
+            --query 'imageScanFindings.findingSeverityCounts' --output json 2>/dev/null || echo '{}')"
+
+          {
+            echo "### ECR scan: ${{ steps.sha.outputs.short }}"
+            echo '```json'
+            echo "$findings"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Reported, not blocking. A base image CVE with no fix available
+          # should not stop a deploy; it should be visible. Turn this into a
+          # gate once you have an agreed policy for what to do when it fires,
+          # because a blocking check nobody can satisfy just gets disabled.
+          echo "::notice::ECR scan findings: $findings"
+
+      # ---------------------------------------------------------------------
+      # The GitOps handoff
+      # ---------------------------------------------------------------------
+      - name: Point the manifest at the new image
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.sha.outputs.short }}'
+          KUSTOMIZATION=kubernetes/apps/demo-app/kustomization.yaml
+          CONFIGMAP=kubernetes/apps/demo-app/service.yaml
+
+          # Match only the newTag line that follows `- name: demo-app`, so this
+          # keeps working when a second image is added to the transformer list.
+          python3 - "$KUSTOMIZATION" "$TAG" <<'PY'
+          import re, sys
+          path, tag = sys.argv[1], sys.argv[2]
+          text = open(path).read()
+          new, count = re.subn(
+              r'(- name: demo-app\n(?:\s+\w+:.*\n)*?\s+newTag: )"[^"]*"',
+              lambda m: m.group(1) + f'"{tag}"',
+              text,
+          )
+          if count != 1:
+              # Zero means the images transformer moved or was renamed and the
+              # deploy would silently keep the old image. More than one means
+              # the pattern is too loose. Both are failures.
+              sys.exit(f"expected exactly 1 newTag substitution in {path}, made {count}")
+          open(path, "w").write(new)
+          print(f"{path}: newTag -> {tag}")
+          PY
+
+          # Keep the page's "Image tag" field honest. If these two ever
+          # disagree, the page lies about which build is running.
+          python3 - "$CONFIGMAP" "$TAG" <<'PY'
+          import re, sys
+          path, tag = sys.argv[1], sys.argv[2]
+          text = open(path).read()
+          new, count = re.subn(r'(app_version: )"[^"]*"', lambda m: m.group(1) + f'"{tag}"', text)
+          if count != 1:
+              sys.exit(f"expected exactly 1 app_version substitution in {path}, made {count}")
+          open(path, "w").write(new)
+          print(f"{path}: app_version -> {tag}")
+          PY
+
+      - name: Check the manifests still build
+        run: |
+          ./scripts/install-tools.sh >/dev/null
+          python3 -m pip install --quiet pyyaml
+          ./.tools/kubectl kustomize kubernetes/apps/demo-app > /tmp/built.yaml
+          python3 scripts/check_kustomize_image.py /tmp/built.yaml
+
+      - name: Commit the new tag
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet; then
+            echo "::notice::Manifests already point at ${{ steps.sha.outputs.short }}; nothing to commit."
+            exit 0
+          fi
+
+          git add kubernetes/apps/demo-app/
+          git commit -m "deploy: demo-app ${{ steps.sha.outputs.short }}
+
+          Image built from ${{ github.sha }} and pushed to ECR.
+          Argo CD syncs this commit; nothing in CI touches the cluster."
+
+          # Rebase rather than force. Another workflow may have committed in
+          # between, and a force push here would discard it.
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin "HEAD:${{ github.ref_name }}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deployed"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image tag | \`${{ steps.sha.outputs.short }}\` |"
+            echo "| source commit | \`${{ github.sha }}\` |"
+            echo "| pushed to ECR | ${{ steps.exists.outputs.found == 'false' && 'yes' || 'already present' }} |"
+            echo
+            echo "Argo CD picks this up on its next poll, within about three minutes."
+            echo "Watch it: \`kubectl -n argocd get app demo-app -w\`"
+          } >> "$GITHUB_STEP_SUMMARY"

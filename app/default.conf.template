@@ -1,0 +1,72 @@
+server {
+    # 8080, not 80. A port below 1024 needs CAP_NET_BIND_SERVICE, and this pod
+    # drops every capability.
+    listen       8080;
+    listen       [::]:8080;
+    server_name  _;
+
+    # Do not advertise the exact nginx version.
+    server_tokens off;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Probe endpoint. Separate from / so readiness checks never pollute the
+    # access log or the request metrics.
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain always;
+        return 200 "ok\n";
+    }
+
+    # Same response, different name, because probe path conventions differ by
+    # team and chart, and a 404 on a probe path is an avoidable outage.
+    location = /readyz {
+        access_log off;
+        add_header Content-Type text/plain always;
+        return 200 "ready\n";
+    }
+
+    # nginx's own counters, read by the nginx-prometheus-exporter sidecar over
+    # loopback. Restricted to 127.0.0.1, so it is not reachable through the
+    # Service or the load balancer: only a container in the same pod shares this
+    # loopback.
+    location = /stub_status {
+        stub_status;
+        access_log off;
+        allow 127.0.0.1;
+        allow ::1;
+        deny all;
+    }
+
+    location / {
+        # =404, not a fallback to /index.html.
+        #
+        # The single-page-app fallback that every nginx snippet uses would make
+        # this server answer 200 to every path that exists and every path that
+        # does not. That is not a static site behaving correctly, it is a
+        # server that cannot tell you anything: a broken link, a typo in a
+        # probe path and a real page all look identical from the outside. This
+        # is one static page, so a missing path is a 404.
+        try_files $uri $uri/ =404;
+
+        # The pod's own identity, substituted into the page on the way out.
+        # ${POD_NAME} and friends are replaced by envsubst at container start;
+        # $host and $uri are left alone because they are not in
+        # NGINX_ENVSUBST_FILTER.
+        sub_filter_once  off;
+        sub_filter_types text/html;
+        sub_filter '__POD_NAME__'      '${POD_NAME}';
+        sub_filter '__POD_NAMESPACE__' '${POD_NAMESPACE}';
+        sub_filter '__NODE_NAME__'     '${NODE_NAME}';
+        sub_filter '__POD_IP__'        '${POD_IP}';
+        sub_filter '__APP_VERSION__'   '${APP_VERSION}';
+        sub_filter '__CLUSTER_NAME__'  '${CLUSTER_NAME}';
+
+        add_header X-Content-Type-Options "nosniff"     always;
+        add_header X-Frame-Options        "DENY"        always;
+        add_header Referrer-Policy        "no-referrer" always;
+        # The page is per-pod, so caching it would hide which pod answered.
+        add_header Cache-Control          "no-store"    always;
+    }
+}

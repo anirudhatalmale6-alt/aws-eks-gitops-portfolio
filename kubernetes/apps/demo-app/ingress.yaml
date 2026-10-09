@@ -1,0 +1,57 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+  annotations:
+    # ALB, internet-facing, in the public subnets the vpc module tagged with
+    # kubernetes.io/role/elb. The controller finds those subnets by tag; if the
+    # Ingress sits at ADDRESS <none> forever, the subnet tags are the first
+    # thing to check.
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # target-type: ip registers the POD IPs directly with the target group.
+    #
+    # The alternative, "instance", registers the NODES and relies on a NodePort,
+    # so every request takes an extra kube-proxy hop and the ALB's health check
+    # tests the node rather than the pod. With the VPC CNI giving every pod a
+    # real VPC address there is no reason to take that hop, and draining works
+    # per pod instead of per node.
+    alb.ingress.kubernetes.io/target-type: ip
+
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+
+    # The ALB health check hits the app's own probe path, not /. If / ever
+    # starts returning a redirect or a 404 the target group still knows the
+    # truth.
+    alb.ingress.kubernetes.io/healthcheck-path: /healthz
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/unhealthy-threshold-count: "2"
+    alb.ingress.kubernetes.io/success-codes: "200"
+
+    # Wait 30 seconds before cutting connections to a draining target, so a
+    # rolling update does not break in-flight requests.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+
+    alb.ingress.kubernetes.io/tags: Project=eks-gitops-portfolio,Environment=dev
+
+    # HTTPS is deliberately NOT configured here. It needs an ACM certificate,
+    # which needs a domain you own and can validate. docs/06-ingress-and-tls.md
+    # has the three extra annotations and the redirect rule to add once you
+    # point a domain at this. Shipping a commented-out certificate ARN that
+    # nobody fills in is worse than saying this plainly.
+spec:
+  ingressClassName: alb
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-app
+                port:
+                  name: http

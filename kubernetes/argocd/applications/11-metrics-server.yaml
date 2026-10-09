@@ -1,0 +1,93 @@
+#
+# metrics-server
+# ==============
+# Supplies `kubectl top` and, more importantly, the CPU numbers the
+# HorizontalPodAutoscaler reads. EKS does not install it.
+#
+# Its absence is a classic silent failure: the HPA is created, reports
+# `<unknown>/60%` in the TARGETS column, and never scales. Nothing is marked
+# unhealthy and no event explains it.
+#
+# kube-prometheus-stack does NOT replace this. Prometheus scrapes the same
+# underlying kubelet metrics, but the HPA reads the metrics.k8s.io API, and only
+# metrics-server (or Prometheus Adapter, which is a heavier thing to run) serves
+# that API.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: metrics-server
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: portfolio
+
+  source:
+    repoURL: https://kubernetes-sigs.github.io/metrics-server/
+    chart: metrics-server
+    targetRevision: 3.14.0
+
+    helm:
+      releaseName: metrics-server
+      values: |
+        replicas: 2
+
+        # Spread over nodes so a node loss does not take the HPA's data source
+        # with it. Not a hard anti-affinity, because on a two node cluster that
+        # would leave the second replica Pending.
+        topologySpreadConstraints:
+          - maxSkew: 1
+            topologyKey: kubernetes.io/hostname
+            whenUnsatisfiable: ScheduleAnyway
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: metrics-server
+
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 192Mi
+
+        # NO args override, deliberately, and this is worth reading before you
+        # add one.
+        #
+        # The chart already passes a sensible default set through
+        # `defaultArgs`, including
+        # --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname,
+        # which is correct on EKS because every node has an InternalIP.
+        #
+        # The `args` value APPENDS to defaultArgs, it does not replace them. Set
+        # --kubelet-preferred-address-types there as well and the container is
+        # launched with the same flag twice, with whichever one wins being a
+        # detail of pflag rather than something this repo should depend on.
+        # Checked by rendering the chart: scripts/check_helm.sh asserts the flag
+        # appears exactly once. If you really need to change it, override
+        # `defaultArgs` wholesale.
+        #
+        # Separately, nearly every metrics-server guide tells you to add
+        # --kubelet-insecure-tls. That disables certificate verification against
+        # the kubelet and is NOT needed on EKS: the kubelet serving certificate
+        # is signed by the cluster CA metrics-server already trusts. It IS
+        # needed on kubeadm or kind clusters with self-signed kubelet
+        # certificates, which is why the advice is everywhere. Know which
+        # cluster you are on. check_helm.sh asserts it is absent here.
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

@@ -1,0 +1,22 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+  labels:
+    app.kubernetes.io/part-of: eks-gitops-portfolio
+    # Pod Security Admission, built into the API server since 1.25 and the
+    # replacement for the removed PodSecurityPolicy.
+    #
+    #   enforce  - the API server REJECTS a pod that breaks the restricted
+    #              profile. No admission webhook, no extra component to install.
+    #   audit    - violations are written to the audit log.
+    #   warn     - violations come back on kubectl as a warning.
+    #
+    # "restricted" requires runAsNonRoot, allowPrivilegeEscalation: false, all
+    # capabilities dropped and a seccomp profile. The demo-app Deployment sets
+    # all four, which is why it is deployable here at all. Deploy the stock
+    # nginx image into this namespace and the API server refuses it.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

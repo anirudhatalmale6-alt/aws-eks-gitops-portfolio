@@ -1,0 +1,58 @@
+#
+# gp3 as the default StorageClass
+# ===============================
+# EKS ships a `gp2` StorageClass and marks it default. gp2 is the previous
+# generation: its throughput and IOPS are tied to volume size, so a 20Gi
+# Prometheus volume gets 60 IOPS and 128 MiB/s whether it needs them or not.
+# gp3 gives a 3000 IOPS / 125 MiB/s baseline at ANY size and costs about 20
+# percent less per GiB.
+#
+# IMPORTANT, and the reason this file has a long comment:
+#
+# Applying this does NOT remove the default flag from gp2, and a cluster with
+# TWO default StorageClasses is a broken cluster. A PVC that does not name a
+# class gets refused, and the error is an event on the PVC rather than anything
+# visible on kubectl get pvc, so Prometheus simply sits in Pending.
+#
+# Take the flag off gp2 as well:
+#
+#   kubectl patch storageclass gp2 -p \
+#     '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
+#
+# scripts/deploy.sh does this for you and is idempotent. It is not done
+# declaratively here because gp2 is created by EKS, a StorageClass's provisioner
+# and parameters are immutable, and having Argo CD adopt an object it did not
+# create in order to flip one annotation is a worse trade than one documented
+# patch.
+#
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  labels:
+    app.kubernetes.io/part-of: eks-gitops-portfolio
+
+provisioner: ebs.csi.aws.com
+
+# WaitForFirstConsumer, not Immediate. An EBS volume can only attach to an
+# instance in its OWN availability zone. Binding immediately creates the volume
+# before the scheduler has picked a node, so roughly two times out of three on a
+# three AZ cluster the pod is then unschedulable, stuck on "volume node affinity
+# conflict". Waiting means the volume is created in the zone the pod landed in.
+volumeBindingMode: WaitForFirstConsumer
+
+# Lets a PVC grow with `kubectl edit pvc`. Without it, a full Prometheus volume
+# means deleting and recreating the PVC, which means losing the data.
+allowVolumeExpansion: true
+
+# Delete, because every volume in this project is a demo volume and leaving
+# orphaned EBS volumes behind after a teardown is how a torn-down stack keeps
+# costing money. Use Retain for anything whose loss would matter.
+reclaimPolicy: Delete
+
+parameters:
+  type: gp3
+  encrypted: "true"
+  fsType: ext4

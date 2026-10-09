@@ -1,0 +1,120 @@
+# Accepted misconfigurations
+# ==========================
+#
+# Three rules in this file, each with a reason and an EXPIRY DATE. The expiry is
+# the point: an unexplained suppression is indistinguishable from a bug someone
+# hid, and a suppression with no end date never gets revisited. When one of these
+# expires, trivy starts reporting the finding again and someone has to look at it
+# on purpose.
+#
+# Nothing here is suppressed because it was inconvenient to fix. The fourth
+# finding trivy originally raised on this repo, AWS-0164 (public subnets
+# auto-assigning public IPs), was genuinely wrong for this architecture and was
+# FIXED rather than listed here. See terraform/modules/vpc/main.tf.
+
+misconfigurations:
+  - id: AWS-0040
+    paths:
+      - "terraform/modules/eks/main.tf"
+    statement: >-
+      Public Kubernetes API endpoint. Accepted for a portfolio cluster that is
+      administered from a laptop on a residential connection with a changing IP,
+      where a private-only endpoint would require a VPN or a bastion that this
+      project deliberately does not build. The endpoint is not unauthenticated:
+      the only way through it is an IAM identity that also holds an EKS access
+      entry, and every API call lands in the control plane audit log. The module
+      exposes endpoint_public_access so a production caller can set it false,
+      and private access is on at the same time, so in-cluster traffic never
+      leaves the VPC.
+    expires_at: 2027-01-08
+
+  - id: AWS-0041
+    paths:
+      - "terraform/modules/eks/main.tf"
+    statement: >-
+      API endpoint reachable from 0.0.0.0/0. This is the DEFAULT value of
+      var.public_access_cidrs, not a hardcoded one, and both the module
+      description and terraform.tfvars.example tell the operator to replace it
+      with their own address. It is open by default only because a developer
+      whose IP changes mid-build would otherwise lock themselves out of the
+      cluster they are in the middle of creating.
+    expires_at: 2027-01-08
+
+  - id: AWS-0104
+    paths:
+      - "terraform/modules/eks/main.tf"
+    statement: >-
+      Unrestricted egress from worker nodes. Required: nodes pull images from
+      ECR, reach the regional STS, EKS, EC2, ELB and CloudWatch endpoints, and
+      every Helm chart in the cluster fetches from an upstream registry. The
+      honest alternative is a full set of interface VPC endpoints plus an egress
+      allow-list, which is roughly 7 USD per endpoint per month and is the right
+      answer in production, not on a demo cluster. Egress is already narrowed in
+      one real way: the S3 gateway endpoint in the vpc module keeps ECR layer
+      traffic inside the VPC rather than sending it out through NAT.
+    expires_at: 2027-01-08
+
+  - id: AWS-0342
+    paths:
+      - "terraform/envs/dev/iam.tf"
+    statement: >-
+      The terraform apply role is allowed iam:PassRole. This rule warns on ANY
+      policy containing the action regardless of how it is scoped, which is the
+      right default, because PassRole is a privilege escalation primitive. It
+      cannot be removed here: a role that creates an EKS cluster has to pass the
+      cluster role to EKS and the node role to the node group, and AWS refuses
+      both calls without it.
+      It is narrowed twice instead. By resource, to roles whose name begins with
+      this stack's prefix, so no pre-existing role in the account, admin
+      included, is passable. By condition, on iam:PassedToService, so even those
+      roles can only be handed to EKS, the EKS node group service, EC2 and VPC
+      flow logs. The DenyIdentityEscalation statement in the same policy then
+      blocks user creation and access key minting outright, which closes the
+      usual escalation chain that PassRole opens.
+    expires_at: 2027-01-08
+
+  # ---------------------------------------------------------------------------
+  # The three below are LOW. CI does not block on LOW, they are listed anyway so
+  # that "the scan is clean" means every finding was read and answered, not that
+  # the noisy ones were filtered out of the report.
+  # ---------------------------------------------------------------------------
+
+  - id: AWS-0089
+    paths:
+      - "terraform/bootstrap/main.tf"
+    statement: >-
+      No S3 server access logging on the terraform state bucket. Server access
+      logs need a second bucket, which then needs its own lifecycle rules and
+      its own exemption from this same rule, and they are delivered best-effort
+      with no guaranteed completeness. For an audit trail of who read or wrote
+      state, the correct tool is a CloudTrail data event selector on this bucket,
+      which is account-level configuration and therefore outside this stack.
+      Recorded here so the gap is a decision rather than an oversight.
+    expires_at: 2027-01-08
+
+  - id: AWS-0033
+    paths:
+      - "terraform/modules/ecr/main.tf"
+    statement: >-
+      ECR repositories use the free AES256 encryption rather than a customer
+      managed KMS key. The module takes a kms_key_arn and will use KMS when one
+      is given; the dev environment does not pass one because a CMK is 1 USD per
+      month plus per-request charges, and the threat it defends against,
+      needing to revoke access to image layers independently of the account, is
+      not a threat this project has. Container images here hold no secrets.
+    expires_at: 2027-01-08
+
+  - id: AWS-0017
+    paths:
+      - "terraform/modules/eks/main.tf"
+      - "terraform/modules/vpc/main.tf"
+    statement: >-
+      CloudWatch log groups use the default CloudWatch encryption rather than a
+      CMK. Both groups are already encrypted at rest; a CMK would add auditable
+      key usage and independent revocation. Not done because encrypting a log
+      group with a CMK requires a key policy granting logs.REGION.amazonaws.com
+      kms:Encrypt and kms:Describe*, and getting that policy wrong makes the log
+      group silently stop accepting events, which on the audit log is worse than
+      the gap being closed. The retention on both groups is 7 days, so the
+      exposure window is small.
+    expires_at: 2027-01-08

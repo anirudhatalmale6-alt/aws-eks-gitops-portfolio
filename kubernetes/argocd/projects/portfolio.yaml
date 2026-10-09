@@ -1,0 +1,84 @@
+#
+# AppProject: the blast radius boundary
+# =====================================
+# Without a project, every Application runs under `default`, which permits any
+# source repository, any destination namespace and any resource kind. One
+# mistyped repoURL in a pull request is then enough to sync somebody else's
+# manifests into this cluster.
+#
+# This project says: only this repo and these three chart registries, only these
+# namespaces, and nothing cluster-scoped except the handful of kinds that
+# genuinely have to be.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: portfolio
+  namespace: argocd
+  finalizers:
+    # Without this finalizer, deleting the project orphans every Application in
+    # it: the Applications stay, pointing at a project that no longer exists,
+    # and refuse to sync with "application references project portfolio which
+    # does not exist".
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: AWS EKS GitOps portfolio project
+
+  sourceRepos:
+    - GIT_REPO_URL_PLACEHOLDER
+    - https://aws.github.io/eks-charts
+    - https://kubernetes-sigs.github.io/metrics-server/
+    - https://prometheus-community.github.io/helm-charts
+
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: demo
+    - server: https://kubernetes.default.svc
+      namespace: monitoring
+    - server: https://kubernetes.default.svc
+      namespace: kube-system
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+
+  # Cluster-scoped resources are listed one by one rather than allowed with a
+  # wildcard. A chart that suddenly wants to create a ClusterRoleBinding nobody
+  # reviewed will fail to sync and say so, which is the entire point.
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: storage.k8s.io
+      kind: StorageClass
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: apiregistration.k8s.io
+      kind: APIService
+    - group: elbv2.k8s.aws
+      kind: IngressClassParams
+    - group: networking.k8s.io
+      kind: IngressClass
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Nothing in this project has any business creating identities or quotas.
+  namespaceResourceBlacklist:
+    - group: ""
+      kind: ResourceQuota
+    - group: ""
+      kind: LimitRange
+
+  orphanedResources:
+    # Report, do not delete. Argo CD flags anything living in these namespaces
+    # that is not in git, which is how you find the thing somebody kubectl
+    # applied by hand at 2am. Setting this to prune instead would make a
+    # mistake in git destructive.
+    warn: true

@@ -1,0 +1,39 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+
+# Local, account-specific values. These are gitignored because the bucket name
+# embeds the AWS account ID and tfvars carries your GitHub username. The
+# .example files next to them are what is committed.
+terraform/envs/*/backend.hcl
+terraform/envs/*/terraform.tfvars
+terraform/bootstrap/backend.tf
+terraform/bootstrap/terraform.tfvars
+
+# Rendered copies of the manifests, produced by scripts/render-manifests.sh
+# from the terraform outputs. The templates with placeholders are what is
+# committed; the rendered output is derived and account-specific.
+kubernetes/**/*.rendered.yaml
+.rendered/
+
+# Local tool cache: downloaded binaries and Helm chart tarballs.
+.tools/
+.helm/
+
+# Editors and OS
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# NEVER commit these. kubeconfig carries cluster credentials; a .pem or .key is
+# a private key. Listed explicitly so that `git add -A` in a hurry cannot
+# publish one.
+kubeconfig
+kubeconfig-*
+*.pem
+*.key

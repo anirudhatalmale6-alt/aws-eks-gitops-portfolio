@@ -1,0 +1,55 @@
+#
+# The demo workload
+# =================
+# Last wave, because its ServiceMonitor and PrometheusRule are CRDs that
+# kube-prometheus-stack installs.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "10"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: portfolio
+
+  source:
+    repoURL: GIT_REPO_URL_PLACEHOLDER
+    targetRevision: main
+    # A kustomize directory. Argo CD detects the kustomization.yaml and runs
+    # kustomize build itself, which is how the image tag written by CI into
+    # that file becomes the deployed image with no further moving parts.
+    path: kubernetes/apps/demo-app
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m
+
+  ignoreDifferences:
+    # The HorizontalPodAutoscaler owns the replica count at runtime. Git says 3;
+    # after a scale-up the cluster says 7. Without this, Argo CD sees a
+    # difference and selfHeal scales the Deployment straight back to 3, fighting
+    # the HPA every reconcile loop. Letting the HPA win on this one field is the
+    # correct answer, and leaving the number in git is still useful as the
+    # starting replica count on a fresh install.
+    - group: apps
+      kind: Deployment
+      name: demo-app
+      jsonPointers:
+        - /spec/replicas

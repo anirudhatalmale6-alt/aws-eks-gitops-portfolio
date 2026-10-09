@@ -1,0 +1,51 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+# This workload calls no AWS API, so it gets no eks.amazonaws.com/role-arn
+# annotation and no IRSA role. A service account with no role attached is the
+# correct default; see terraform/modules/irsa for the pattern when a workload
+# does need one.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-app-config
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+data:
+  # Replaced by scripts/render-manifests.sh from the terraform outputs, so the
+  # page shows the real cluster name rather than a placeholder.
+  cluster_name: "CLUSTER_NAME_PLACEHOLDER"
+  # Overwritten by the image-build workflow alongside the image tag, so the
+  # page and the running image can never disagree about which build it is.
+  app_version: "dev"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: demo-app
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    # Scraped by Prometheus through the ServiceMonitor. Kept on the same
+    # Service rather than a second headless one, because the ServiceMonitor
+    # selects by port NAME and ignores the others.
+    - name: metrics
+      port: 9113
+      targetPort: metrics
+      protocol: TCP

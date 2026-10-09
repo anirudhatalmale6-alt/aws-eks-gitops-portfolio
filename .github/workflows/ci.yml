@@ -1,0 +1,99 @@
+#
+# Offline checks
+# ==============
+# Everything that can be verified without touching AWS. No credentials, no OIDC,
+# no role to assume, so this runs on pull requests from forks and on any branch,
+# and a contributor with no AWS account gets useful feedback.
+#
+# It runs exactly the same script a developer runs locally: scripts/validate.sh.
+# Keeping CI and local on one script is the only way "it passes on my machine"
+# stops being a thing people say.
+#
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Needed to publish the trivy SARIF report into the Security tab.
+  security-events: write
+
+concurrency:
+  # One run per branch. A force-push mid-run cancels the previous one instead of
+  # leaving two runs racing to report on the same ref.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Restore BEFORE installing, so a cache hit makes the install step a
+      # no-op. Putting the cache step after the install would download
+      # everything on every run and then dutifully cache it for nobody.
+      - name: Cache tool downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            .tools
+            ~/.tflint.d
+          key: tools-${{ runner.os }}-${{ hashFiles('scripts/install-tools.sh') }}
+
+      # The versions come from scripts/install-tools.sh, so CI and a laptop run
+      # identical binaries. Every download is checksum-verified against the
+      # publisher's own checksum file, and the script skips anything already
+      # restored from the cache at the right version.
+      - name: Install pinned tools
+        run: ./scripts/install-tools.sh
+
+      - name: Install PyYAML
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Run the full offline suite
+        run: ./scripts/validate.sh
+        env:
+          NO_COLOR: "1"
+
+      # Reported, never blocking. These are the findings that are real but are
+      # a cost or complexity trade rather than a defect, and a build that fails
+      # on them teaches people to ignore the scanner.
+      - name: Security findings below the blocking threshold
+        if: always()
+        run: |
+          echo '### trivy: MEDIUM and LOW findings' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo 'These do not fail the build. Accepted findings, each with a reason and an expiry date, are in `.trivyignore.yaml`.' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          ./.tools/trivy config --quiet \
+            --ignorefile .trivyignore.yaml \
+            --skip-dirs .tools --skip-dirs .helm --skip-dirs '**/.terraform' \
+            --severity MEDIUM,LOW . >> "$GITHUB_STEP_SUMMARY" 2>&1 || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # SARIF goes to the Security tab, where findings are tracked over time and
+      # a new one on a pull request is annotated inline on the diff.
+      - name: Security scan to SARIF
+        if: always()
+        run: |
+          ./.tools/trivy config --quiet \
+            --ignorefile .trivyignore.yaml \
+            --skip-dirs .tools --skip-dirs .helm --skip-dirs '**/.terraform' \
+            --format sarif --output trivy.sarif . || true
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-config

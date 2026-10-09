@@ -1,0 +1,49 @@
+#
+# Sync waves
+# ==========
+# Argo CD sorts every resource it is about to apply by the
+# argocd.argoproj.io/sync-wave annotation, lowest first, and waits for each wave
+# to become Healthy before starting the next. The waves in this directory are:
+#
+#   -20  platform        StorageClass, so volumes can be provisioned
+#   -10  load balancer controller + metrics-server
+#     0  monitoring      installs the ServiceMonitor and PrometheusRule CRDs
+#    10  demo-app        USES those CRDs, so it cannot go first
+#
+# Without the waves, Argo CD applies everything at once, demo-app's
+# ServiceMonitor is rejected with "no matches for kind ServiceMonitor", and the
+# Application sits Degraded until somebody hits refresh. It usually recovers on
+# retry, which is worse than failing, because it means the ordering bug is
+# invisible until the day it does not recover.
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "-20"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: portfolio
+
+  source:
+    repoURL: GIT_REPO_URL_PLACEHOLDER
+    targetRevision: main
+    path: kubernetes/platform
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: kube-system
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 3m

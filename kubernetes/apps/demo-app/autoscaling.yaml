@@ -1,0 +1,68 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+spec:
+  # minAvailable, not maxUnavailable, because this number has to hold while the
+  # cluster autoscaler drains a node and while a SPOT instance is reclaimed with
+  # two minutes' notice. Both of those are voluntary evictions and both respect
+  # this budget.
+  #
+  # Keep it strictly below the replica count. minAvailable equal to replicas is
+  # the classic self-inflicted deadlock: nothing can ever be evicted, so a node
+  # drain hangs forever and the cluster autoscaler gives up on scaling down.
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: demo-app
+
+  minReplicas: 3
+  maxReplicas: 10
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          # Percentage of the REQUEST, not of the node. The nginx container
+          # requests 25m, so this scales up at about 15m of actual use. Note
+          # that an HPA on CPU needs metrics-server; without it the HPA shows
+          # <unknown>/60% forever and never acts. kube-prometheus-stack does not
+          # install metrics-server, which is why it is a separate Argo CD
+          # Application in kubernetes/platform.
+          averageUtilization: 60
+
+  behavior:
+    scaleUp:
+      # React quickly to load.
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      # Come down slowly. Five minutes of stability before shrinking stops the
+      # autoscaler from oscillating around a spiky traffic pattern, which costs
+      # more in pod churn than the extra replicas cost in CPU.
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60

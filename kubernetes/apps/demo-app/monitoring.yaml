@@ -1,0 +1,126 @@
+#
+# Everything in this file is a kube-prometheus-stack CRD. Apply it before the
+# stack is installed and kubectl says "no matches for kind ServiceMonitor",
+# which is why the Argo CD Application for demo-app declares a sync wave after
+# the monitoring stack.
+#
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+    # kube-prometheus-stack only adopts ServiceMonitors carrying the release
+    # label of the Prometheus that should scrape them, unless the chart is told
+    # otherwise. The monitoring Application sets
+    # serviceMonitorSelectorNilUsesHelmValues: false AND the stack is installed
+    # with the release name "kube-prometheus-stack", so either route works. The
+    # label is here because relying on the nil-selector behaviour is the kind
+    # of thing that breaks on a chart upgrade.
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: demo-app
+  namespaceSelector:
+    matchNames:
+      - demo
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demo-app
+  namespace: demo
+  labels:
+    app.kubernetes.io/name: demo-app
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: demo-app.rules
+      rules:
+        #
+        # Four alerts. Each one fires on a condition you could not have guessed
+        # from a dashboard, and each has a "for" window long enough that a
+        # single scrape blip does not page anyone.
+        #
+        - alert: DemoAppAbsent
+          # absent() is the alert people forget to write. Every other rule here
+          # is evaluated over the app's own metrics, so if the app disappears
+          # entirely they all go quiet and the dashboards look peaceful. This is
+          # the one that notices silence.
+          expr: absent(up{job="demo-app"} == 1)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "demo-app is not being scraped by Prometheus"
+            description: >-
+              No healthy demo-app target for 5 minutes. Either every pod is
+              down, or the ServiceMonitor stopped matching the Service. Check
+              `kubectl -n demo get endpoints demo-app` first: empty endpoints
+              means a pod problem, populated endpoints with no target means a
+              label selector problem.
+
+        - alert: DemoAppNoReadyReplicas
+          expr: kube_deployment_status_replicas_ready{namespace="demo", deployment="demo-app"} == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "demo-app has zero ready replicas"
+            description: >-
+              The Deployment exists but nothing is serving. Look at
+              `kubectl -n demo describe pod` for probe failures, and check the
+              container log for the 25-assert-config-rendered.sh message, which
+              means the nginx config mount was not writable.
+
+        - alert: DemoAppBelowDisruptionBudget
+          expr: >-
+            kube_deployment_status_replicas_ready{namespace="demo", deployment="demo-app"}
+            < kube_poddisruptionbudget_status_desired_healthy{namespace="demo", poddisruptionbudget="demo-app"}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "demo-app is below its PodDisruptionBudget"
+            description: >-
+              Fewer ready replicas than the PDB requires. On a SPOT node group
+              this usually means capacity was reclaimed and the replacement
+              nodes have not joined yet. Sustained for more than ten minutes it
+              means the scheduler cannot place the pods at all, most often
+              Insufficient cpu or memory.
+
+        - alert: DemoAppPodRestarting
+          expr: increase(kube_pod_container_status_restarts_total{namespace="demo", container="nginx"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "demo-app container restarting repeatedly"
+            description: >-
+              More than three restarts in fifteen minutes. If this started right
+              after a deploy, check the liveness probe timeout against how long
+              the container actually takes to answer; a liveness probe that is
+              tighter than real startup time turns a slow boot into a crash
+              loop.
+
+        #
+        # A recording rule. Prometheus evaluates this once per interval and
+        # stores the result, so a dashboard panel reads one cheap series instead
+        # of recomputing a rate() over raw counters on every refresh. On a
+        # dashboard with a dozen panels that is the difference between a
+        # responsive Grafana and one that times out.
+        #
+    - name: demo-app.recording
+      rules:
+        - record: demo_app:http_requests:rate5m
+          expr: sum(rate(nginx_http_requests_total{job="demo-app"}[5m]))
+
+        - record: demo_app:connections_active:avg
+          expr: avg(nginx_connections_active{job="demo-app"})
