@@ -39,10 +39,65 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  #
+  # Is AWS wired up yet?
+  # --------------------
+  # On a freshly cloned repository none of the repository variables exist, so
+  # this workflow would reach configure-aws-credentials and fail. A red X on
+  # the first push, for a repository that is working exactly as intended, is
+  # noise that teaches people to ignore red X's.
+  #
+  # So: check first, and SKIP the build job if the variables are absent. A
+  # skipped job is neutral in the UI, and the notice says what to do about it.
+  # The offline ci workflow still runs and is still the meaningful signal.
+  #
+  preflight:
+    name: is AWS configured
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+
+    steps:
+      - id: check
+        run: |
+          # Written as if-statements, not `[[ -z x ]] && missing+=(y)`.
+          # GitHub runs `run:` blocks under `bash -eo pipefail`, so a `[[ ]]`
+          # test that evaluates FALSE returns 1 and kills the step. That form
+          # would therefore break precisely when the variables ARE set, which
+          # is the case nobody tests.
+          missing=()
+          if [[ -z "${{ vars.AWS_ECR_PUSH_ROLE_ARN }}" ]]; then missing+=(AWS_ECR_PUSH_ROLE_ARN); fi
+          if [[ -z "${{ vars.AWS_REGION }}"           ]]; then missing+=(AWS_REGION);           fi
+          if [[ -z "${{ vars.ECR_REPOSITORY }}"       ]]; then missing+=(ECR_REPOSITORY);       fi
+
+          if (( ${#missing[@]} > 0 )); then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping the image build: repository variables not set (${missing[*]}). Run 'terraform -chdir=terraform/envs/dev output github_variable_setup_commands' after 'make apply' and run what it prints. See docs/03-cicd.md."
+            {
+              echo "### Image build skipped"
+              echo
+              echo "This repository has not been connected to an AWS account yet."
+              echo
+              echo "Missing repository variables:"
+              for m in "${missing[@]}"; do echo "- \`$m\`"; done
+              echo
+              echo "After \`make apply\`, run:"
+              echo '```sh'
+              echo 'terraform -chdir=terraform/envs/dev output github_variable_setup_commands'
+              echo '```'
+              echo 'and run the commands it prints. See `docs/03-cicd.md`.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build and push
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: preflight
+    if: needs.preflight.outputs.configured == 'true'
 
     steps:
       - uses: actions/checkout@v4
